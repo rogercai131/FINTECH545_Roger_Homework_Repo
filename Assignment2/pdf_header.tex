@@ -1,0 +1,6 @@
+% LaTeX header used when building Assignment2_Answers.pdf from Answers.md with pandoc.
+% Same fix as the course's assignment.qmd: without it, a table near the bottom of a page can print
+% its header, break, and repeat the header on the next page with no rows. Require room for a few lines first.
+\usepackage{needspace}
+\usepackage{etoolbox}
+\AtBeginEnvironment{longtable}{\Needspace*{8\baselineskip}}
