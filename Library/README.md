@@ -61,7 +61,8 @@ Not usually called directly from your own code — these back the option-string
 dispatch and shared statistics used across the other files:
 
 - `handle_missing_data(data, missing_strategy="drop_row")` — the
-  `"drop_row"`/`"pairwise"` dispatcher used by `covariance.py`.
+  `"drop_row"`/`"pairwise"` dispatcher used by `covariance.py` and
+  `moments.py`.
 - `aicc(log_likelihood, num_params, num_obs)` — corrected Akaike Information
   Criterion, used by `distributions.py` and `copula.py`.
 
@@ -119,13 +120,36 @@ fixed = fix_psd_matrix(bad_corr, method="near_psd")
 np.linalg.eigvalsh(fixed.values)      # -> all eigenvalues >= 0 now
 ```
 ```
-eigenvalues before fix: [-0.9206  1.9000  2.0206]
-eigenvalues after fix:  [ 0.0000  1.4609  1.5391]
+eigenvalues before fix: [-0.6488  1.4600  2.1888]
+eigenvalues after fix:  [ 0.0000  1.2284  1.7716]
 ```
 
 `method="near_psd"` (Rebonato & Jackel eigenvalue clipping, fast) or
 `"higham"` (alternating projections, slower but the true nearest PSD matrix).
 Auto-detects covariance vs. correlation input from the diagonal.
+
+Also in this file: `classify_psd` diagnoses a matrix *without* changing it,
+reporting PD / PSD / non-PSD plus the eigenvalue evidence:
+
+```python
+from psd_fix import classify_psd
+
+classify_psd(bad_corr)["summary"]
+classify_psd(fixed)["summary"]
+```
+```
+non-PSD: 1 eigenvalue(s) below -threshold (2.19e-08): [-0.6488].
+PSD: all eigenvalues are above -threshold (1.77e-08); 1 eigenvalue(s) within threshold of zero; 1 small negative eigenvalue(s) were treated as zero.
+```
+
+Returns a dict (`"classification"`, `"summary"`, `"eigenvalues"`,
+`"adjusted_eigenvalues"`, `"threshold"`, the indices/values of small negative
+eigenvalues treated as zero and of real negatives, min/max eigenvalue, and
+symmetry info). The tolerance is scale-aware — `threshold = atol + rtol *
+max|eigenvalue|`, defaults `atol=1e-12`, `rtol=1e-8` — so the verdict is a
+*numerical* one that depends on the tolerance, not a proof of PSD-ness.
+`asymmetry_strategy="report"` (default) refuses to classify a non-symmetric
+matrix; `"symmetrize"` classifies `(A + A^T)/2` and says so in the summary.
 
 ### `cholesky.py` — factorizing a PSD matrix
 
@@ -185,9 +209,74 @@ return_calculate(prices, method="arithmetic")
 2 2024-01-04  0.039604
 ```
 
-`method="arithmetic"` (`P_t/P_{t-1} - 1`) or `"log"` (`ln(P_t/P_{t-1})`).
-`date_column` (default `"Date"`) is carried along untouched; pass `None` if
-every column is a price series.
+`method="classical"` (`P_t - P_{t-1}`), `"arithmetic"` (`P_t/P_{t-1} - 1`), or
+`"log"`/`"geometric"` (`ln(P_t/P_{t-1})`). `date_column` (default `"Date"`) is
+carried along untouched; pass `None` if every column is a price series.
+
+Also in this file, the reverse direction — prices from returns — under the
+three return models, plus the closed-form mean/std of the next price when
+`r ~ N(mu, sigma^2)`:
+
+```python
+import numpy as np
+import pandas as pd
+from returns import price_from_returns, expected_price_moments
+
+r = np.random.default_rng(1).normal(0.0, 0.2, 100_000)   # simulated returns
+rows = {}
+for m in ["classical", "arithmetic", "geometric"]:
+    p = price_from_returns(r, start_price=100, method=m)
+    e = expected_price_moments(100, sigma=0.2, method=m)
+    rows[m] = [p.mean(), p.std(), e["Mean"], e["Std"]]
+pd.DataFrame(rows, index=["Sim Mean", "Sim Std", "Expected Mean", "Expected Std"]).T
+```
+```
+              Sim Mean    Sim Std  Expected Mean  Expected Std
+classical    99.999082   0.199308     100.000000      0.200000
+arithmetic   99.908189  19.930763     100.000000     20.000000
+geometric   101.914446  20.550435     102.020134     20.609778
+```
+
+`method="classical"`
+(`P_t = P_{t-1} + r_t`), `"arithmetic"` (`P_t = P_{t-1}(1 + r_t)`), or
+`"geometric"` (`P_t = P_{t-1}e^{r_t}`). `price_from_returns` takes
+`horizon="one_step"` (every return is a separate scenario for the same next
+period) or `"path"` (returns are consecutive periods, compounded in order —
+the exact inverse of `return_calculate`).
+
+### `moments.py` — mean, variance, skewness, kurtosis
+
+```python
+import pandas as pd
+from moments import first_four_moments
+
+data = pd.DataFrame({
+    "A": [0.01, -0.02, 0.015, 0.005, -0.01, 0.02],
+    "B": [0.03, -0.01, 0.00, -0.04, 0.02, 0.01],
+})
+first_four_moments(data, method="unbiased", kurtosis_type="excess")
+```
+```
+                 A         B
+Mean      0.003333  0.001667
+Variance  0.000237  0.000617
+Skewness -0.704959 -0.870689
+Kurtosis -0.929875  0.735427
+```
+
+`method="unbiased"` (sample estimators: `n-1` variance, adjusted skew/kurtosis —
+same as pandas/Excel) or `"biased"` (population formulas, same as
+`scipy.stats.skew/kurtosis(bias=True)`). `kurtosis_type="excess"` (normal = 0)
+or `"raw"` (normal = 3). A Series returns a Series; a DataFrame returns one
+column per numeric input column, with `missing_strategy="drop_row"`/`"pairwise"`.
+
+Notes on getting spec number from output:
+m = first_four_moments(df["x"])   # Series
+m["Skewness"]                     # a single float
+
+m = first_four_moments(df)        # DataFrame
+m.loc["Kurtosis", "x"]            # a single float
+m["x"]                            # Series of all four moments for column x
 
 ### `distributions.py` — fitting a distribution to data
 
@@ -397,3 +486,13 @@ A few things worth knowing before reading a test file or a failure:
   its early-exercise boundary are more sensitive to the finite-difference
   bump size than the other Greeks/options, so that one Delta uses a looser
   tolerance than the rest of the test.
+- **`price_from_returns` / `expected_price_moments`** and the `"classical"`
+  method of `return_calculate` (in `test_returns.py`) are checked against
+  their closed-form definitions, a prices → returns → prices round trip, and
+  a fixed-seed simulation of the next price's mean/std.
+- **`classify_psd`** (in `test_psd_fix.py`) has no reference CSV either, so
+  it's checked against small hand-built matrices with known eigenvalues (PD,
+  singular PSD, PSD with injected rounding error, non-PSD, non-symmetric).
+- **`test_moments.py`** has no reference CSV in `Tests.xlsx`, so it checks
+  `first_four_moments` against pandas (`.var()`/`.skew()`/`.kurt()`) for
+  `method="unbiased"` and `scipy.stats` (`bias=True`) for `method="biased"`.

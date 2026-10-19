@@ -13,10 +13,11 @@ the same functions.
 """
 
 from covariance import covariance_matrix, ew_covariance_matrix, kendall_correlation_matrix
-from psd_fix import fix_psd_matrix
+from psd_fix import fix_psd_matrix, classify_psd
 from cholesky import cholesky_psd
 from simulation import simulate_normal
-from returns import return_calculate
+from returns import return_calculate, price_from_returns, expected_price_moments
+from moments import first_four_moments
 from distributions import (
     fit_normal_distribution,
     fit_t_distribution,
