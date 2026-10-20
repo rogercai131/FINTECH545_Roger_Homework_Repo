@@ -1,5 +1,7 @@
 """
-Tests for copula.py, based on Tests.xlsx sections 13.5 - 13.9.
+Tests for copula.py, based on Tests.xlsx sections 13.5 - 13.9. simulate_copula
+has no reference CSV; it's checked against the existing Gaussian (Test 9.1)
+and t copula fits it should reproduce, plus simulated-moment checks.
 
 As in test_multivariate_t.py, the fitted copula nu/log-likelihood values
 involve a 1-D numerical optimizer, so tests allow a small amount of
@@ -22,7 +24,9 @@ from copula import (
     compare_copulas,
     t_copula_tail_dependence,
     simulate_t_copula_portfolio_var_es,
+    simulate_copula,
 )
+from portfolio_risk import calculate_portfolio_var_es
 
 RTOL = 1e-3
 
@@ -103,3 +107,85 @@ def test_gaussian_copula_zero_tail_dependence_reference():
     result = t_copula_tail_dependence(correlation, nu=1e6)
 
     assert np.isclose(result.loc[0, "Lambda"], 0.0, atol=1e-3)
+
+
+# --- simulate_copula ---
+
+
+def test_simulate_copula_gaussian_matches_portfolio_risk():
+    # Same marginals, correlation estimate, and seed as Test 9.1's Gaussian
+    # copula => the exact same simulated returns, hence the same VaR/ES.
+    portfolio = load_csv("test9_1_portfolio.csv", encoding="utf-8-sig")
+    returns = load_csv("test9_1_returns.csv", encoding="utf-8-sig")
+    marginals = dict(zip(portfolio["Stock"], portfolio["Distribution"]))
+
+    sims = simulate_copula(returns, copula="gaussian", marginals=marginals, seed=1)
+
+    expected = calculate_portfolio_var_es(portfolio, returns, seed=1).set_index("Stock")
+    values = (portfolio["Holding"] * portfolio["Starting Price"]).values
+    pnl = sims[portfolio["Stock"]].values * values
+    total = pnl.sum(axis=1)
+    assert np.isclose(-np.quantile(pnl[:, 0], 0.05), expected.loc["A", "VaR95"])
+    assert np.isclose(-np.quantile(total, 0.05), expected.loc["Total", "VaR95"])
+
+
+def test_simulate_copula_t_fit_matches_fit_t_copula():
+    returns = load_csv("test13_returns.csv")
+    sims, fit = simulate_copula(returns, copula="t", num_simulations=1000, seed=1, output="both")
+    reference = fit_t_copula(returns)
+
+    assert list(sims.columns) == list(returns.columns)
+    assert sims.shape == (1000, returns.shape[1])
+    assert np.isclose(fit["nu"], reference["nu"], rtol=RTOL)
+    assert np.allclose(fit["correlation"].values, reference["correlation"].values)
+    assert all(d.dist.name == "t" for d in fit["marginals"].values())
+
+
+def test_simulate_copula_reproduces_marginals_and_correlation():
+    returns = load_csv("test13_returns.csv")
+    sims, fit = simulate_copula(returns, marginals="normal", output="both", seed=2)
+
+    # With Normal marginals, each simulated column's mean/std should match
+    # its fitted Normal, and the Pearson correlation should match the
+    # copula's (sampling-noise tolerance at 100k draws).
+    for col in returns.columns:
+        assert sims[col].mean() == pytest.approx(fit["marginals"][col].mean(), abs=3e-2 * fit["marginals"][col].std())
+        assert sims[col].std() == pytest.approx(fit["marginals"][col].std(), rel=2e-2)
+    assert np.allclose(sims.corr().values, fit["correlation"].values, atol=2e-2)
+
+
+def test_t_copula_has_more_joint_extremes_than_gaussian():
+    returns = load_csv("test13_returns.csv").iloc[:, :2]
+
+    def joint_tail_count(sims):
+        lows = sims < sims.quantile(0.01)
+        return lows.all(axis=1).sum()
+
+    gaussian = simulate_copula(returns, copula="gaussian", correlation="kendall", seed=3)
+    t_low_nu = simulate_copula(returns, copula="t", nu=3.0, seed=3)
+
+    assert joint_tail_count(t_low_nu) > joint_tail_count(gaussian)
+
+
+def test_simulate_copula_is_reproducible_with_seed():
+    returns = load_csv("test13_returns.csv")
+    a = simulate_copula(returns, num_simulations=500, seed=7)
+    b = simulate_copula(returns, num_simulations=500, seed=7)
+    assert a.equals(b)
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"copula": "clayton"},
+        {"marginals": "lognormal"},
+        {"correlation": "pearson"},
+        {"copula": "t", "correlation": "normal_scores"},
+        {"copula": "gaussian", "nu": 5.0},
+        {"output": "fit"},
+    ],
+)
+def test_simulate_copula_invalid_options(kwargs):
+    returns = load_csv("test13_returns.csv")
+    with pytest.raises(ValueError):
+        simulate_copula(returns, num_simulations=10, **kwargs)

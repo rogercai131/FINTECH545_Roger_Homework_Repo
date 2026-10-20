@@ -5,6 +5,13 @@ Covers: FINTECH545 Tests 7.1 - 7.6 (fitting a Normal distribution, fitting
 a Student's t distribution by MLE, a linear regression with t-distributed
 errors, AICc of a fitted t distribution, and fitting a Normal Inverse
 Gaussian (NIG) distribution by both the method of moments and MLE).
+
+Every fit function takes an `output` option:
+  - "params" (default): a pd.Series of the fitted parameters.
+  - "distribution": a frozen scipy.stats distribution built from those
+    parameters (e.g. `stats.norm(loc=mu, scale=sigma)`), ready for
+    `.pdf()`, `.cdf()`, `.ppf()`, `.rvs()`, `.mean()`, `.std()`, etc.
+  - "both": a tuple `(params, distribution)`.
 """
 
 import numpy as np
@@ -14,7 +21,27 @@ from scipy import stats, optimize
 from utils import aicc as _aicc
 
 
-def fit_normal_distribution(data: pd.Series) -> pd.Series:
+_OUTPUT_OPTIONS = ("params", "distribution", "both")
+
+
+def _check_output(output: str) -> None:
+    if output not in _OUTPUT_OPTIONS:
+        raise ValueError(
+            f"Unsupported output '{output}'. Expected one of: 'params', 'distribution', 'both'."
+        )
+
+
+def _format_output(params: pd.Series, distribution, output: str):
+    """Return the fitted parameters, the frozen distribution, or both,
+    depending on the `output` option."""
+    if output == "params":
+        return params
+    if output == "distribution":
+        return distribution
+    return params, distribution
+
+
+def fit_normal_distribution(data: pd.Series, output: str = "params"):
     """
     Fit a Normal distribution to a 1-D sample by its sample mean and
     (unbiased, ddof=1) sample standard deviation.
@@ -23,20 +50,25 @@ def fit_normal_distribution(data: pd.Series) -> pd.Series:
     ---------------
     data : pd.Series (or array-like)
         A 1-D sample of observations.
+    output : str, default "params"
+        "params", "distribution", or "both" (see Output).
 
     Output
     ------
-    pd.Series
-        Index ["mu", "sigma"] holding the fitted mean and standard
-        deviation.
+    - "params": pd.Series with index ["mu", "sigma"] holding the fitted
+      mean and standard deviation.
+    - "distribution": the frozen `scipy.stats.norm(loc=mu, scale=sigma)`.
+    - "both": the tuple (params, distribution).
     """
+    _check_output(output)
     values = np.asarray(data)
     mu = values.mean()
     sigma = values.std(ddof=1)
-    return pd.Series({"mu": mu, "sigma": sigma})
+    params = pd.Series({"mu": mu, "sigma": sigma})
+    return _format_output(params, stats.norm(loc=mu, scale=sigma), output)
 
 
-def fit_t_distribution(data: pd.Series) -> pd.Series:
+def fit_t_distribution(data: pd.Series, output: str = "params"):
     """
     Fit a (location-scale) Student's t distribution to a 1-D sample by
     maximum likelihood.
@@ -45,19 +77,26 @@ def fit_t_distribution(data: pd.Series) -> pd.Series:
     ---------------
     data : pd.Series (or array-like)
         A 1-D sample of observations.
+    output : str, default "params"
+        "params", "distribution", or "both" (see Output).
 
     Output
     ------
-    pd.Series
-        Index ["mu", "sigma", "nu"] holding the fitted location, scale,
-        and degrees of freedom.
+    - "params": pd.Series with index ["mu", "sigma", "nu"] holding the
+      fitted location, scale, and degrees of freedom.
+    - "distribution": the frozen `scipy.stats.t(df=nu, loc=mu, scale=sigma)`.
+      Note its `.std()` is sigma * sqrt(nu / (nu - 2)), not sigma — sigma
+      is a scale parameter, not the standard deviation.
+    - "both": the tuple (params, distribution).
     """
+    _check_output(output)
     values = np.asarray(data)
     nu, mu, sigma = stats.t.fit(values)
-    return pd.Series({"mu": mu, "sigma": sigma, "nu": nu})
+    params = pd.Series({"mu": mu, "sigma": sigma, "nu": nu})
+    return _format_output(params, stats.t(df=nu, loc=mu, scale=sigma), output)
 
 
-def fit_t_regression(y: pd.Series, x: pd.DataFrame) -> pd.Series:
+def fit_t_regression(y: pd.Series, x: pd.DataFrame, output: str = "params"):
     """
     Fit a linear regression y = Alpha + B1*x1 + B2*x2 + ... + error, where
     the error term is assumed to follow a (zero-centered) Student's t
@@ -76,14 +115,20 @@ def fit_t_regression(y: pd.Series, x: pd.DataFrame) -> pd.Series:
         The predictor variables, shape (n, k). Column names/order don't
         matter — the output always names coefficients B1..Bk in column
         order.
+    output : str, default "params"
+        "params", "distribution", or "both" (see Output).
 
     Output
     ------
-    pd.Series
-        Index ["mu", "sigma", "nu", "Alpha", "B1", ..., "Bk"]. `mu` is
-        always 0.0 (the error term is centered; any nonzero mean is
-        absorbed into `Alpha`).
+    - "params": pd.Series with index ["mu", "sigma", "nu", "Alpha", "B1",
+      ..., "Bk"]. `mu` is always 0.0 (the error term is centered; any
+      nonzero mean is absorbed into `Alpha`).
+    - "distribution": the frozen distribution of the *error term*,
+      `scipy.stats.t(df=nu, loc=0, scale=sigma)` (the regression
+      coefficients are only in the params).
+    - "both": the tuple (params, distribution).
     """
+    _check_output(output)
     y_values = np.asarray(y)
     x_values = np.asarray(x)
     if x_values.ndim == 1:
@@ -122,10 +167,11 @@ def fit_t_regression(y: pd.Series, x: pd.DataFrame) -> pd.Series:
     sigma = np.exp(result.x[1 + k])
     nu = 2.0 + np.exp(result.x[2 + k])
 
-    output = {"mu": 0.0, "sigma": sigma, "nu": nu, "Alpha": alpha}
+    fitted = {"mu": 0.0, "sigma": sigma, "nu": nu, "Alpha": alpha}
     for i, beta in enumerate(betas, start=1):
-        output[f"B{i}"] = beta
-    return pd.Series(output)
+        fitted[f"B{i}"] = beta
+    params = pd.Series(fitted)
+    return _format_output(params, stats.t(df=nu, loc=0.0, scale=sigma), output)
 
 
 def t_distribution_aicc(data: pd.Series, fitted: pd.Series = None) -> float:
@@ -157,7 +203,7 @@ def t_distribution_aicc(data: pd.Series, fitted: pd.Series = None) -> float:
     return _aicc(log_likelihood, num_params=3, num_obs=len(values))
 
 
-def fit_nig_distribution(data: pd.Series, method: str = "moments") -> pd.Series:
+def fit_nig_distribution(data: pd.Series, method: str = "moments", output: str = "params"):
     """
     Fit a Normal Inverse Gaussian (NIG) distribution to a 1-D sample.
 
@@ -173,20 +219,27 @@ def fit_nig_distribution(data: pd.Series, method: str = "moments") -> pd.Series:
             than MLE.
           - "mle": maximum likelihood, via `scipy.stats.norminvgauss.fit`.
             More accurate but slower (numerical optimization).
+    output : str, default "params"
+        "params", "distribution", or "both" (see Output).
 
     Output
     ------
-    pd.Series
-        Index ["mu", "alpha", "beta", "delta"] holding the fitted NIG
-        location, tail-heaviness, asymmetry, and scale parameters.
+    - "params": pd.Series with index ["mu", "alpha", "beta", "delta"]
+      holding the fitted NIG location, tail-heaviness, asymmetry, and
+      scale parameters.
+    - "distribution": the frozen `scipy.stats.norminvgauss(a, b, loc,
+      scale)`, converted to scipy's scaled parameterization:
+      a = alpha * delta, b = beta * delta, loc = mu, scale = delta.
+    - "both": the tuple (params, distribution).
 
     Raises
     ------
     ValueError
-        If `method` is not "moments"/"mle".
+        If `method` is not "moments"/"mle", or `output` is not supported.
     """
     if method not in ("moments", "mle"):
         raise ValueError(f"Unsupported method '{method}'. Expected one of: 'moments', 'mle'.")
+    _check_output(output)
 
     values = np.asarray(data)
 
@@ -194,9 +247,10 @@ def fit_nig_distribution(data: pd.Series, method: str = "moments") -> pd.Series:
         # scipy's norminvgauss(a, b, loc, scale) is a *scaled* parameterization:
         # alpha = a / scale, beta = b / scale, mu = loc, delta = scale.
         a, b, loc, scale = stats.norminvgauss.fit(values)
-        return pd.Series(
+        params = pd.Series(
             {"mu": loc, "alpha": a / scale, "beta": b / scale, "delta": scale}
         )
+        return _format_output(params, stats.norminvgauss(a, b, loc=loc, scale=scale), output)
 
     # Method of moments: invert the NIG mean/variance/skewness/kurtosis
     # formulas (Barndorff-Nielsen) to recover mu, alpha, beta, delta.
@@ -220,4 +274,6 @@ def fit_nig_distribution(data: pd.Series, method: str = "moments") -> pd.Series:
     delta = delta_gamma / gamma
     mu = mean - delta * beta / gamma
 
-    return pd.Series({"mu": mu, "alpha": alpha, "beta": beta, "delta": delta})
+    params = pd.Series({"mu": mu, "alpha": alpha, "beta": beta, "delta": delta})
+    distribution = stats.norminvgauss(alpha * delta, beta * delta, loc=mu, scale=delta)
+    return _format_output(params, distribution, output)

@@ -2,6 +2,7 @@
 Copula-based dependence modeling: fitting each variable's own marginal
 distribution separately from how the variables move together (their
 "copula"), comparing a Gaussian vs. a Student's t copula, tail dependence,
+simulating joint returns from a Gaussian or t copula (`simulate_copula`),
 and simulating a multi-asset portfolio's VaR/ES under a t copula.
 
 Covers: FINTECH545 Tests 13.5 - 13.9.
@@ -13,9 +14,10 @@ from scipy.stats import norm, t as t_dist, chi2
 from scipy.special import gammaln
 from scipy.optimize import minimize_scalar
 
-from distributions import fit_t_distribution
+from distributions import fit_normal_distribution, fit_t_distribution
 from covariance import kendall_correlation_matrix
 from cholesky import cholesky_psd
+from psd_fix import fix_psd_matrix
 from utils import aicc as _aicc
 
 
@@ -115,11 +117,28 @@ def fit_t_copula(data: pd.DataFrame) -> dict:
         fitted `nu` (again, the dependence structure's log-likelihood
         alone, not including the marginals').
     """
-    labels = data.columns
     _, uniform_scores = _fit_t_margins(data)
 
     correlation_df = kendall_correlation_matrix(data)
-    correlation = correlation_df.values
+    nu, log_likelihood = _fit_t_copula_nu(uniform_scores, correlation_df.values)
+
+    return {
+        "correlation": correlation_df,
+        "nu": nu,
+        "log_likelihood": log_likelihood,
+    }
+
+
+def _fit_t_copula_nu(uniform_scores: np.ndarray, correlation: np.ndarray):
+    """
+    Fit a t copula's degrees of freedom by 1-D profile likelihood, holding
+    its correlation matrix fixed.
+
+    Returns
+    -------
+    (nu, log_likelihood) : tuple of floats
+        The fitted degrees of freedom and the copula log-likelihood there.
+    """
     correlation_inv = np.linalg.inv(correlation)
     _, log_det_correlation = np.linalg.slogdet(correlation)
     k = correlation.shape[0]
@@ -136,13 +155,27 @@ def fit_t_copula(data: pd.DataFrame) -> dict:
         lambda nu: -copula_log_likelihood(nu), bounds=(2.0001, 1000), method="bounded",
         options={"xatol": 1e-10},
     )
-    nu = result.x
+    return result.x, -result.fun
 
-    return {
-        "correlation": correlation_df,
-        "nu": nu,
-        "log_likelihood": -result.fun,
-    }
+
+def _simulate_copula_uniforms(correlation: np.ndarray, copula: str, nu, num_simulations: int, rng) -> np.ndarray:
+    """
+    Draw correlated uniform (0, 1) scores from a Gaussian or t copula.
+
+    Gaussian: Z = L @ standard normals (L = Cholesky factor of the
+    correlation), U = Phi(Z).
+    t: the same correlated normals divided by sqrt(chi2_nu / nu) -- which
+    makes them jointly multivariate-t -- then U = t_nu CDF of those.
+
+    Returns an array of shape (num_assets, num_simulations).
+    """
+    factor = cholesky_psd(pd.DataFrame(correlation)).values
+    normal_draws = factor @ rng.standard_normal((correlation.shape[0], num_simulations))
+    if copula == "gaussian":
+        return norm.cdf(normal_draws)
+    chi_square_draws = chi2.rvs(nu, size=num_simulations, random_state=rng)
+    t_draws = normal_draws / np.sqrt(chi_square_draws / nu)
+    return t_dist.cdf(t_draws, df=nu)
 
 
 def compare_copulas(data: pd.DataFrame) -> pd.DataFrame:
@@ -277,12 +310,9 @@ def simulate_t_copula_portfolio_var_es(
     nu_copula = t_copula["nu"]
 
     rng = np.random.default_rng(seed)
-    factor = cholesky_psd(correlation).values
-
-    normal_draws = factor @ rng.standard_normal((n_assets, num_simulations))
-    chi_square_draws = chi2.rvs(nu_copula, size=num_simulations, random_state=rng)
-    t_draws = normal_draws / np.sqrt(chi_square_draws / nu_copula)
-    simulated_uniform = t_dist.cdf(t_draws, df=nu_copula)
+    simulated_uniform = _simulate_copula_uniforms(
+        correlation.values, "t", nu_copula, num_simulations, rng
+    )
 
     starting_values = {}
     simulated_pnl = {}
@@ -315,3 +345,144 @@ def simulate_t_copula_portfolio_var_es(
     return pd.DataFrame(
         rows, columns=["Stock", var_col, es_col, f"{var_col}_Pct", f"{es_col}_Pct"]
     )
+
+
+_COPULAS = ("gaussian", "t")
+_MARGINALS = ("normal", "t")
+_CORRELATIONS = ("normal_scores", "spearman", "kendall")
+
+
+def simulate_copula(
+    returns: pd.DataFrame,
+    copula: str = "gaussian",
+    marginals="t",
+    correlation: str = None,
+    nu: float = None,
+    num_simulations: int = 100_000,
+    seed: int = None,
+    output: str = "simulations",
+):
+    """
+    Simulate joint returns from a Gaussian or Student's t copula: each
+    column keeps its own fitted marginal distribution, while the copula
+    supplies how the columns move together.
+
+    Steps
+    -----
+    1. Fit each column's marginal distribution (Normal or t).
+    2. Map the historical returns to uniform scores U = F(x) with each
+       column's own fitted CDF.
+    3. Estimate the copula's correlation matrix (and, for a t copula, its
+       degrees of freedom nu by profile likelihood on U).
+    4. Simulate correlated uniforms from the copula, and map each column
+       back to returns with its own inverse CDF: x = F^-1(U).
+
+    Expected input
+    ---------------
+    returns : pd.DataFrame
+        Historical returns, one column per asset, no NaN values.
+    copula : str, default "gaussian"
+          - "gaussian": no tail dependence (joint extremes are rare).
+          - "t": tail dependence controlled by the copula's own nu
+            (smaller nu = extreme moves happen together more often).
+    marginals : str or dict, default "t"
+        The marginal distribution for every column ("normal" or "t"), or a
+        dict {column: "normal"/"t"} to choose per column. Columns missing
+        from the dict default to "t".
+    correlation : str, optional
+        How the copula's correlation matrix is estimated:
+          - "normal_scores": Pearson correlation of the normal scores
+            Phi^-1(U) (Gaussian copula only — the approach used by
+            `portfolio_risk.calculate_portfolio_var_es`).
+          - "spearman": Spearman rank correlation of the returns.
+          - "kendall": sin(pi/2 * Kendall's tau), PSD-repaired (the
+            approach used by `fit_t_copula`).
+        Default: "normal_scores" for a Gaussian copula, "kendall" for a t
+        copula. A rank-based matrix that isn't PSD is repaired with
+        `psd_fix.fix_psd_matrix(method="near_psd")`.
+    nu : float, optional
+        t copula only: use this degrees of freedom instead of fitting it.
+    num_simulations : int, default 100000
+        Number of joint scenarios to simulate.
+    seed : int, optional
+        Seed for reproducible simulation draws.
+    output : str, default "simulations"
+          - "simulations": just the simulated returns DataFrame.
+          - "both": the tuple (simulations, fit), where `fit` is a dict
+            with "marginals" ({column: frozen scipy distribution}),
+            "correlation" (pd.DataFrame), and "nu" (float, or None for a
+            Gaussian copula).
+
+    Output
+    ------
+    pd.DataFrame
+        `num_simulations` rows, same columns as `returns`, holding the
+        simulated returns (see `output` for the extra fit details).
+
+    Raises
+    ------
+    ValueError
+        If an option string is not supported, `correlation="normal_scores"`
+        is combined with a t copula, or `nu` is given for a Gaussian copula.
+    """
+    if copula not in _COPULAS:
+        raise ValueError(f"Unsupported copula '{copula}'. Expected one of: 'gaussian', 't'.")
+    if output not in ("simulations", "both"):
+        raise ValueError(f"Unsupported output '{output}'. Expected one of: 'simulations', 'both'.")
+    if correlation is None:
+        correlation = "normal_scores" if copula == "gaussian" else "kendall"
+    if correlation not in _CORRELATIONS:
+        raise ValueError(
+            f"Unsupported correlation '{correlation}'. "
+            "Expected one of: 'normal_scores', 'spearman', 'kendall'."
+        )
+    if copula == "t" and correlation == "normal_scores":
+        raise ValueError("correlation='normal_scores' is only for copula='gaussian'.")
+    if copula == "gaussian" and nu is not None:
+        raise ValueError("nu is only used with copula='t'.")
+
+    labels = returns.columns
+    values = returns.values
+    choices = {col: marginals for col in labels} if isinstance(marginals, str) else {
+        col: marginals.get(col, "t") for col in labels
+    }
+
+    # 1-2. Fit each marginal and map the history to uniform scores.
+    fitted_marginals = {}
+    uniform_scores = np.zeros_like(values, dtype=float)
+    for i, col in enumerate(labels):
+        choice = choices[col].strip().lower()
+        if choice not in _MARGINALS:
+            raise ValueError(f"Unsupported marginal '{choice}' for '{col}'. Expected one of: 'normal', 't'.")
+        fit = fit_normal_distribution if choice == "normal" else fit_t_distribution
+        fitted_marginals[col] = fit(values[:, i], output="distribution")
+        uniform_scores[:, i] = fitted_marginals[col].cdf(values[:, i])
+
+    # 3. The copula's correlation matrix.
+    if correlation == "normal_scores":
+        corr = np.corrcoef(norm.ppf(uniform_scores), rowvar=False)
+    elif correlation == "spearman":
+        corr = returns.corr(method="spearman").values
+    else:
+        corr = kendall_correlation_matrix(returns).values
+    if np.linalg.eigvalsh(corr)[0] < 0:
+        corr = fix_psd_matrix(pd.DataFrame(corr, index=labels, columns=labels)).values
+
+    if copula == "t" and nu is None:
+        nu, _ = _fit_t_copula_nu(uniform_scores, corr)
+
+    # 4. Simulate copula uniforms, then invert each column's own marginal.
+    rng = np.random.default_rng(seed)
+    simulated_uniform = _simulate_copula_uniforms(corr, copula, nu, num_simulations, rng)
+    simulations = pd.DataFrame(
+        {col: fitted_marginals[col].ppf(simulated_uniform[i]) for i, col in enumerate(labels)}
+    )
+
+    if output == "simulations":
+        return simulations
+    fit_details = {
+        "marginals": fitted_marginals,
+        "correlation": pd.DataFrame(corr, index=labels, columns=labels),
+        "nu": nu,
+    }
+    return simulations, fit_details

@@ -27,7 +27,25 @@ through keyword options rather than needing a separate function per variant.
 
 Every module here is a plain Python file, not a namespaced sub-package, so
 the only setup needed is having the `Library/` folder itself on your
-`sys.path` — e.g. run your script from inside `Library/`, or add it explicitly:
+`sys.path`.
+
+**One-time setup (recommended):** register the folder with the repo's
+`.venv` via a `.pth` file. Python reads every `*.pth` file in
+`site-packages` at startup and adds each path in it to `sys.path`, so after
+this, any notebook or script using `.venv` — in any folder — can import the
+Library with no `sys.path` line at all. Run from the repo root with the venv
+active:
+
+```bash
+python -c "import site, pathlib; (pathlib.Path(site.getsitepackages()[0]) / 'risk_library.pth').write_text(str(pathlib.Path('Library').resolve()))"
+```
+
+Restart any running notebook kernel afterwards (`.pth` files are only read
+when Python starts). The file lives inside `.venv/` (gitignored), so re-run
+this if you ever rebuild the venv or move the repo.
+
+**Fallback** (a different Python environment without the `.pth` file): add
+the folder at the top of the script/notebook instead:
 
 ```python
 import sys
@@ -50,6 +68,22 @@ from Risk_Library import covariance_matrix
 Both give you the exact same function — use whichever reads better for the
 script you're writing. The examples below use the standalone style, one
 module at a time.
+
+### Editor autocomplete (VS Code)
+
+VS Code's autocomplete/hover docs (Pylance) read code without running it, so
+they never see the `.pth` file or a runtime `sys.path` line. The repo's
+`.vscode/settings.json` points Pylance at this folder instead:
+
+```json
+{ "python.analysis.extraPaths": ["./Library"] }
+```
+
+With that in place, `from Risk_Library import ` shows a dropdown of every
+function (the names listed in `Risk_Library.__all__`), and hovering a
+function shows its docstring. This is an editor-only setting — actually
+importing the Library when code runs is handled by the `.pth` file (or the
+fallback `sys.path` line). (Reload the VS Code window after changing it.)
 
 ---
 
@@ -307,6 +341,29 @@ Also in this file: `fit_t_regression(y, x)` (linear regression with
 t-distributed errors), `t_distribution_aicc(data, fitted=None)`, and
 `fit_nig_distribution(data, method="moments"/"mle")` (Normal Inverse Gaussian).
 
+Every fit function also takes `output="params"` (default, the Series above),
+`"distribution"` (a frozen `scipy.stats` distribution built from the fit), or
+`"both"` (a `(params, distribution)` tuple):
+
+```python
+norm_fit = fit_normal_distribution(sample, output="distribution")   # = stats.norm(loc=mu, scale=sigma)
+norm_fit.ppf(0.05)              # 5% quantile
+norm_fit.cdf(0.0)               # P(X <= 0)
+norm_fit.mean(), norm_fit.std()
+```
+```
+-0.021971
+0.414231
+(0.003333, 0.015384)
+```
+
+The frozen distributions are `stats.norm(loc=mu, scale=sigma)`,
+`stats.t(df=nu, loc=mu, scale=sigma)`, the error term
+`stats.t(df=nu, loc=0, scale=sigma)` for `fit_t_regression`, and
+`stats.norminvgauss(a=alpha*delta, b=beta*delta, loc=mu, scale=delta)` for
+NIG (scipy's scaled parameterization). For the t, note `.std()` is
+`sigma * sqrt(nu / (nu - 2))`, not `sigma`.
+
 ### `risk_metrics.py` — VaR and Expected Shortfall
 
 ```python
@@ -321,9 +378,24 @@ dtype: float64
 ```
 
 `distribution="normal"`/`"t"` picks the fitted distribution;
-`method="analytical"` (closed-form quantile) or `"simulation"` (draw from the
-fitted distribution and take the empirical quantile). `calculate_es` has the
+`method="analytical"` (closed-form quantile), `"simulation"` (draw from the
+fitted distribution and take the empirical quantile), or `"historical"`
+(historical simulation: no distribution is fitted — VaR is minus the
+empirical alpha-quantile of the observed returns, ES minus the average of the
+returns at or below it; `distribution` is ignored). `calculate_es` has the
 same signature, returning `"ES Absolute"`/`"ES Diff from Mean"`.
+
+```python
+calculate_var(returns, method="historical", alpha=0.05)
+```
+
+On the 1,000 returns of a fat-tailed stock (`Midterm/Practice/practice1/problem2.csv`):
+
+| 5% alpha | VaR Absolute | ES Absolute |
+|---|---|---|
+| Normal, analytical | 0.036586 | 0.045792 |
+| t, analytical | 0.036102 | 0.048230 |
+| Historical | 0.034963 | 0.046824 |
 
 ### `portfolio_risk.py` — portfolio VaR/ES via copula simulation
 
@@ -442,6 +514,36 @@ from copula import compare_copulas, simulate_t_copula_portfolio_var_es
 compare_copulas(returns)   # AICc/BIC comparison of a Gaussian vs. a T copula
 ```
 
+**Simulating joint returns from a copula:**
+
+```python
+from copula import simulate_copula
+
+# `returns` = a DataFrame of historical returns, one column per asset
+sims, fit = simulate_copula(returns, copula="t", marginals="t", seed=1, output="both")
+sims.head(3)
+fit["nu"]
+```
+```
+         A1        A2        A3        A4        A5
+0  0.003080 -0.017871  0.007903 -0.012124  0.008206
+1  0.005695  0.018715  0.009990  0.005764  0.009014
+2  0.004238 -0.006460 -0.006232  0.034638  0.011710
+5.9464
+```
+
+Each column keeps its own fitted marginal distribution and the copula links
+them: `copula="gaussian"` (no tail dependence) or `"t"` (joint extremes more
+likely; its `nu` is fitted, or pass `nu=` yourself). `marginals="normal"`/`"t"`
+for every column, or a dict like `{"A": "normal", "B": "t"}` to choose per
+column. `correlation="normal_scores"` (Gaussian default, same as
+`portfolio_risk`), `"spearman"`, or `"kendall"` (t default, same as
+`fit_t_copula`). `output="simulations"` (default) or `"both"` to also get the
+fit: `{"marginals": frozen scipy distributions, "correlation", "nu"}`.
+Turn the simulated returns into portfolio P&L/VaR yourself, or use the
+ready-made `portfolio_risk.calculate_portfolio_var_es` /
+`simulate_t_copula_portfolio_var_es` below.
+
 Also in this file: `gaussian_copula_log_likelihood(data)`,
 `fit_t_copula(data)`, `t_copula_tail_dependence(correlation, nu)` (pairwise
 lower tail dependence under a fitted t copula), and
@@ -490,6 +592,21 @@ A few things worth knowing before reading a test file or a failure:
   method of `return_calculate` (in `test_returns.py`) are checked against
   their closed-form definitions, a prices → returns → prices round trip, and
   a fixed-seed simulation of the next price's mean/std.
+- **`method="historical"`** of `calculate_var`/`calculate_es` (in
+  `test_risk_metrics.py`) has no reference CSV, so it's checked against a
+  small hand-built sample, against numpy's quantile/tail-mean directly, and
+  for converging to the analytical Normal answer on a large normal sample.
+- **`simulate_copula`** (in `test_copula.py`) has no reference CSV, so it's
+  checked against what it should reproduce: with the same seed, its Gaussian
+  copula gives exactly Test 9.1's `calculate_portfolio_var_es` VaR, and its
+  t copula's fitted `nu`/correlation match `fit_t_copula`. It also checks the
+  simulated means, standard deviations and correlation, and that a low-`nu`
+  t copula gives more joint extremes than a Gaussian one.
+- **`output="distribution"`/`"both"`** of the fit functions (in
+  `test_distributions.py`) is checked by confirming each frozen scipy
+  distribution's mean/median/std match its fitted parameters through that
+  distribution's own formulas (and, for the NIG method-of-moments fit, that
+  it reproduces the sample mean and variance).
 - **`classify_psd`** (in `test_psd_fix.py`) has no reference CSV either, so
   it's checked against small hand-built matrices with known eigenvalues (PD,
   singular PSD, PSD with injected rounding error, non-PSD, non-symmetric).

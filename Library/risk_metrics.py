@@ -3,7 +3,8 @@ Value at Risk (VaR) and Expected Shortfall (ES) for a single return series.
 
 Covers: FINTECH545 Tests 8.1 - 8.6 (VaR/ES under a Normal or Student's t
 distributional assumption, computed either analytically or by simulating
-from the fitted distribution).
+from the fitted distribution), plus historical simulation (VaR/ES read
+straight off the observed returns, with no distribution fitted).
 """
 
 import numpy as np
@@ -28,6 +29,23 @@ def _fit(data: pd.Series, distribution: str):
         )
 
 
+_METHODS = ("analytical", "simulation", "historical")
+
+
+def _check_method(method: str) -> None:
+    if method not in _METHODS:
+        raise ValueError(
+            f"Unsupported method '{method}'. "
+            "Expected one of: 'analytical', 'simulation', 'historical'."
+        )
+
+
+def _historical_returns(data) -> np.ndarray:
+    """The observed returns as a 1-D float array, with NaNs dropped."""
+    values = np.asarray(data, dtype=float).ravel()
+    return values[~np.isnan(values)]
+
+
 def calculate_var(
     data: pd.Series,
     distribution: str = "normal",
@@ -46,11 +64,12 @@ def calculate_var(
     data : pd.Series (or array-like)
         A 1-D sample of returns.
     distribution : str, default "normal"
-        Which distribution to assume for the returns:
+        Which distribution to assume for the returns (ignored by
+        `method="historical"`, which fits no distribution):
           - "normal": fit a Normal distribution (`distributions.fit_normal_distribution`).
           - "t": fit a Student's t distribution (`distributions.fit_t_distribution`).
     method : str, default "analytical"
-        How to compute the quantile once the distribution is fit:
+        How to compute the quantile:
           - "analytical": use the closed-form quantile of the fitted
             distribution.
           - "simulation": draw `num_simulations` samples from the fitted
@@ -58,6 +77,13 @@ def calculate_var(
             analytical answer as `num_simulations` grows, but carries
             Monte Carlo noise (particularly in the tail, where relatively
             few simulated points fall).
+          - "historical": historical simulation -- no distribution is
+            fitted; the empirical alpha-quantile of the observed returns
+            themselves is used (NaNs dropped; `np.quantile`'s default
+            linear interpolation between observations). Makes no
+            distributional assumption, but can only "see" losses as bad as
+            those in the sample, and is noisy with little data in the tail
+            (e.g. 1000 returns at alpha=0.05 leaves only ~50 tail points).
     alpha : float, default 0.05
         The tail probability (e.g. 0.05 for a 95% VaR).
     num_simulations : int, default 100000
@@ -73,16 +99,22 @@ def calculate_var(
           - "VaR Diff from Mean": the same, but relative to the fitted
             mean rather than to zero (VaR Absolute - fitted mean's
             contribution) -- equivalently, VaR Absolute + fitted mean.
+            For "historical", the sample mean plays the fitted mean's role.
 
     Raises
     ------
     ValueError
         If `distribution` or `method` is not a supported option.
     """
-    if method not in ("analytical", "simulation"):
-        raise ValueError(
-            f"Unsupported method '{method}'. Expected one of: 'analytical', 'simulation'."
-        )
+    _check_method(method)
+
+    if method == "historical":
+        returns = _historical_returns(data)
+        var_absolute = -np.quantile(returns, alpha)
+        return pd.Series({
+            "VaR Absolute": var_absolute,
+            "VaR Diff from Mean": var_absolute + returns.mean(),
+        })
 
     mu, sigma, nu = _fit(data, distribution)
 
@@ -121,17 +153,25 @@ def calculate_es(
     ------------------------
     Same shape as `calculate_var` above, but returns
     Index ["ES Absolute", "ES Diff from Mean"] instead. See `calculate_var`
-    for the meaning of each parameter.
+    for the meaning of each parameter. With `method="historical"`, ES is
+    minus the average of the observed returns at or below their empirical
+    alpha-quantile (the historical VaR cutoff).
 
     Raises
     ------
     ValueError
         If `distribution` or `method` is not a supported option.
     """
-    if method not in ("analytical", "simulation"):
-        raise ValueError(
-            f"Unsupported method '{method}'. Expected one of: 'analytical', 'simulation'."
-        )
+    _check_method(method)
+
+    if method == "historical":
+        returns = _historical_returns(data)
+        cutoff = np.quantile(returns, alpha)
+        es_absolute = -returns[returns <= cutoff].mean()
+        return pd.Series({
+            "ES Absolute": es_absolute,
+            "ES Diff from Mean": es_absolute + returns.mean(),
+        })
 
     mu, sigma, nu = _fit(data, distribution)
 

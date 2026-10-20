@@ -103,3 +103,61 @@ def test_fit_nig_distribution_invalid_method():
     data = load_csv("test7_5.csv")["x1"]
     with pytest.raises(ValueError):
         fit_nig_distribution(data, method="not_a_real_method")
+
+
+# --- output="distribution"/"both": the frozen scipy distribution must match
+# --- the fitted parameters (checked against each distribution's own formulas).
+
+
+def test_fit_normal_distribution_frozen_output():
+    data = load_csv("test7_1.csv")["x1"]
+    params, dist = fit_normal_distribution(data, output="both")
+
+    assert dist.dist.name == "norm"
+    assert np.isclose(dist.mean(), params["mu"])
+    assert np.isclose(dist.std(), params["sigma"])
+    assert np.isclose(fit_normal_distribution(data, output="distribution").std(), params["sigma"])
+
+
+def test_fit_t_distribution_frozen_output():
+    data = load_csv("test7_2.csv")["x1"]
+    params, dist = fit_t_distribution(data, output="both")
+
+    assert dist.dist.name == "t"
+    assert np.isclose(dist.median(), params["mu"])
+    # sigma is the scale, so the std is sigma * sqrt(nu / (nu - 2)).
+    nu = params["nu"]
+    assert np.isclose(dist.std(), params["sigma"] * np.sqrt(nu / (nu - 2)))
+
+
+def test_fit_t_regression_frozen_output_is_error_distribution():
+    data = load_csv("test7_3.csv")
+    params, dist = fit_t_regression(data["y"], data.drop(columns=["y"]), output="both")
+
+    assert dist.dist.name == "t"
+    assert np.isclose(dist.median(), 0.0)
+    assert np.isclose(dist.kwds["scale"], params["sigma"])
+    assert np.isclose(dist.kwds["df"], params["nu"])
+
+
+@pytest.mark.parametrize("method", ["moments", "mle"])
+def test_fit_nig_distribution_frozen_output(method):
+    data = load_csv("test7_5.csv")["x1"]
+    params, dist = fit_nig_distribution(data, method=method, output="both")
+
+    assert dist.dist.name == "norminvgauss"
+    # NIG mean = mu + delta * beta / gamma, gamma = sqrt(alpha^2 - beta^2):
+    # confirms the conversion to scipy's (a, b, loc, scale) is right.
+    gamma = np.sqrt(params["alpha"] ** 2 - params["beta"] ** 2)
+    assert np.isclose(dist.mean(), params["mu"] + params["delta"] * params["beta"] / gamma)
+    if method == "moments":
+        # Method of moments matches the sample's mean and variance exactly.
+        assert np.isclose(dist.mean(), data.mean())
+        assert np.isclose(dist.var(), data.var(ddof=1))
+
+
+def test_fit_invalid_output():
+    data = load_csv("test7_1.csv")["x1"]
+    for fit in (fit_normal_distribution, fit_t_distribution, fit_nig_distribution):
+        with pytest.raises(ValueError):
+            fit(data, output="frozen")
